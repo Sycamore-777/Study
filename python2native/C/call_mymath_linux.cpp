@@ -1,4 +1,4 @@
-// test_linux.cpp
+
 #include <dlfcn.h>
 #include <iostream>
 #include "mymath_c_api.h"
