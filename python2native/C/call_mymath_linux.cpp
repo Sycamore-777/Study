@@ -1,4 +1,4 @@
-
+// 在 Linux 下使用 C++ 调用 Python 封装的 C API 动态库
 #include <dlfcn.h>
 #include <iostream>
 #include "mymath_c_api.h"
