@@ -36,6 +36,7 @@ sub_status, sub_result = MATLAB_CLIENT.sub_func(
 print(f"add_func({a}, {b}) = {add_result} (status: {add_status})")
 print(f"sub_func({a}, {b}) = {sub_result} (status: {sub_status})")
 
+
 # # ==================================
 # # ★ 调用 MATLAB 类 TODO: matlab2024b 似乎依然不支持类的调用
 # # ==================================
@@ -46,3 +47,8 @@ print(f"sub_func({a}, {b}) = {sub_result} (status: {sub_status})")
 # print(f"Class_example.add({a}, {b}) = {class_instance.result}")
 # class_instance = class_instance.subtract(float(a), float(b))  # 调用 subtract 方法
 # print(f"Class_example.subtract({a}, {b}) = {class_instance.result}")
+
+# ==================================
+# ★ 关闭 MATLAB Runtime 客户端
+# ==================================
+MATLAB_CLIENT.terminate()
