@@ -4,3 +4,4 @@
 /encrypt/**/*.lic
 /encrypt/**/dist/
 /**/*.log
+/tmp/
