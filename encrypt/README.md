@@ -55,7 +55,7 @@
     encrypt_publisher.create_keys() 
     ```
 
-3. 公钥和派生密钥放在了customer中的license_guard.py中，使用时建议将程序封装后再发布。
+3. 公钥和派生密钥放在了customer中的license_guard.py中，使用时再发布。
 
 4. publisher使用前也可以先运行一下如下代码进行初始化：
     ```python
