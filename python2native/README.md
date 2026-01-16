@@ -52,3 +52,8 @@
 - `mymath.pyx` 中使用 `cdef public` 导出 C 接口，便于在 Python 编译出的模块上直接获取原生函数符号。
 - 若需要改用 C++，可将 `setup.py` 的 `language` 改为 `"c++"`，并调整编译指令。
 - Windows 调用 C 接口时，请使用对应的编译器和 `.pyd` 名称，按需修改 `dlopen` 逻辑或直接链接导出符号。
+
+# 在其他环境中运行
+## 在其他版本的新环境运行步骤如下：
+- 安装Cython:`pip install Cython`
+- 安装动态链接库：`python -m pip install -e .`;如果安装失败，可以禁止构建隔离`python -m pip install -e . --no-build-isolation`
