@@ -1,1 +1,6 @@
-./UDP/state_update.log
+/UDP/state_update.log
+/encrypt/**/build/
+/encrypt/**/*.txt
+/encrypt/**/*.lic
+/encrypt/**/dist/
+/**/*.log
