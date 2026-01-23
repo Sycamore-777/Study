@@ -11,7 +11,7 @@
   在 Docker 容器内获取宿主机的fingerprint。
 
 ■ 主要函数功能:
-  
+
 
 ■ 功能特性:
 
@@ -26,11 +26,15 @@
 "心之所向，素履以往；生如逆旅，一苇以航。"
 """
 
-# ============================================================== 
+# ==============================================================
 # %%
 
 import license_guard
 
 if __name__ == "__main__":
-    fingerprint, host_ids, _raw = license_guard.build_host_fingerprint()
-    print (f"Host fingerprint: {fingerprint}")
+    # fingerprint, _ = license_guard.build_expected_fingerprint()
+    # print(f"Host fingerprint: {fingerprint}")
+    fingerprint, message = license_guard.build_expected_fingerprint()
+    print(f"Host fingerprint: {fingerprint}")
+    print()
+    print(f"Message: {message}")

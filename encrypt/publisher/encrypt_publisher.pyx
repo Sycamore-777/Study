@@ -28,6 +28,7 @@
 """
 import issue_keys
 import issue_license
+import publisher_init
 
 
 # -------------- func: 生成一组私钥-公钥 ---------
@@ -46,26 +47,33 @@ cpdef public create_keys():
 
 # -------------- func: 生成license ---------
 cpdef public create_license(private_key_b64: str,
-                            app_secret_b64: str,
+                            master_key_b64: str,
                             target_fingerprint_sha256: str,
+                            fingerprint_source: str,
                             issued_to: str,
                             license_id: str,
-                            not_before_utc: str,
-                            not_after_utc: str):
+                            not_before_utc: str = "2026-01-13T00:00:00Z",
+                            not_after_utc: str = "2027-01-13T00:00:00Z"):
     """
     生成license
     """
     try:
-      issue_license.create_write_lic(private_key_b64=private_key_b64,
-                                      app_secret_b64=app_secret_b64,
-                                      target_fingerprint_sha256=target_fingerprint_sha256,
-                                      issued_to=issued_to,
-                                      license_id=license_id,
-                                      not_before_utc=not_before_utc,
-                                      not_after_utc=not_after_utc,
-                                      )
+      issue_license.create_write_lic(
+          private_key_b64=private_key_b64,
+          master_key_b64=master_key_b64,
+          target_fingerprint_sha256=target_fingerprint_sha256,
+          fingerprint_source=fingerprint_source,
+          issued_to=issued_to,
+          license_id=license_id,
+          not_before_utc=not_before_utc,
+          not_after_utc=not_after_utc,
+      )
     except Exception as e:
         print("生成 license 时出错,请检查各项参数是否正确！")
         print("错误信息:", e )
         return False
     return True
+
+cpdef init_publisher():
+  publisher_init.publisher_init()
+

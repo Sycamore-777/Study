@@ -30,17 +30,33 @@ import license_guard
 
 
 # -------------- func: 获取宿主机指纹字符串 ---------
-cpdef public get_fingerprint():
+cpdef  get_fingerprint():
     """
     返回一个固定的字符串，模拟“获取宿主机指纹”的功能
     """
-    fingerprint, host_ids, _raw = license_guard.build_host_fingerprint()
+    fingerprint, _ = license_guard.build_expected_fingerprint()
     print (f"Host fingerprint: {fingerprint}")
     return fingerprint
 
 # -------------- func: 检查 license 的合法性 ---------
-cpdef public check_license():
+cpdef  check_license(
+                issuer_public_key_b64: str,
+                license_master_key_b64: str,
+                app_secret_b64: str,
+                license_path: str = "/app/license.lic",
+                # license_aad: bytes = "LICv2".encode("utf-8"),
+                # allowed_container_sources: Optional[Set[str]] = None,
+            ):
+    
+    
     """
     调用 license_guard 进行 license 检查
     """
-    license_guard.check_license()
+    license_guard.check_license(
+                issuer_public_key_b64=issuer_public_key_b64,
+                license_master_key_b64=license_master_key_b64,
+                app_secret_b64=app_secret_b64,
+                license_path=license_path,
+                # license_aad=license_aad,
+                # allowed_container_sources=allowed_container_sources
+                )
