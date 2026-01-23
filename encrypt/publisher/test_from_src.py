@@ -28,6 +28,8 @@
 # %%
 from __future__ import annotations
 import sys
+from publisher_init import publisher_init
+import issue_license
 
 
 # =============================👐Seperate👐=============================
@@ -42,11 +44,9 @@ def test_function():
 # =============================👐Seperate👐=============================
 
 if __name__ == "__main__":
-    import encrypt_publisher_pkg
-
     ## -------------- step: 初始化测试环境 --------------
     print("初始化测试环境...")
-    encrypt_publisher_pkg.init_publisher()
+    publisher_init()
 
     ## -------------- step: 测试license生成 --------------
 
@@ -67,7 +67,7 @@ if __name__ == "__main__":
     NOT_AFTER_UTC = "2027-01-13T00:00:00Z"
 
     print("check issue license starting...")
-    encrypt_publisher_pkg.create_license(
+    issue_license.create_write_lic(
         private_key_b64=PRIVATE_KEY_B64,
         master_key_b64=MASTER_KEY_B64,
         target_fingerprint_sha256=TARGET_FINGERPRINT_SHA256,
@@ -78,6 +78,6 @@ if __name__ == "__main__":
         not_after_utc=NOT_AFTER_UTC,
     )
     print("check issue license passed")
-    encrypt_publisher_pkg.create_keys()
+    # create_keys()
 
 # %%

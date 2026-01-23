@@ -55,7 +55,7 @@ def ensure_file_exists(filename: str, content: str) -> None:
 
 def publisher_init() -> None:
     # -------------- step: 配置需要检查的文件 ---------
-    filenames: List[str] = ["private_key_b64.txt", "app_secret_b64.txt"]
+    filenames: List[str] = ["private_key_b64.txt", "master_key_b64.txt"]
 
     # -------------- step: 检查是否存在这两个文件 ---------
     for name in filenames:

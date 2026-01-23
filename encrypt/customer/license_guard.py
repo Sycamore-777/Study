@@ -4,36 +4,46 @@
 文件名    : license_guard.py
 创建者    : Sycamore
 创建日期  : 2026-01-13
-最后修改  : 2026-01-13
-版本号    : v1.0.0
+最后修改  : 2026-01-16
+版本号    : v1.1.0
 
 ■ 用途说明:
-  Docker 容器内授权守护：读取宿主机只读挂载的硬件/系统标识生成指纹，
-  再读取加密版许可证(.lic)，执行“验签 -> 解密 -> 绑定校验 -> 有效期校验”，
-  校验通过后才允许程序继续运行。
+  离线授权守护（可运行于：Windows 本机 / Linux 本机 / Docker 容器）：
+  1) 计算“期望机器指纹 expected_fingerprint_sha256”
+     - v1.0.0: 仅支持 Docker 中从 /host 读取宿主机标识（见旧版 build_host_fingerprint）。[CHANGED]
+     - v1.1.0: 使用 host_fingerprint.build_fingerprint() 自动选择可用来源：
+               host-attest > docker-host-mount > native （并由 guard 二次约束容器内禁止 native）。[CHANGED]
+  2) 读取加密许可证 .lic（JSON 包裹密文结构）
+  3) Ed25519 验签：防篡改（改日期/字段会导致验签失败）
+  4) AES-GCM 解密 payload：使许可证内容不可直接读懂
+  5) 规则校验：
+     - 指纹绑定校验 fingerprint_sha256
+     - （可选）fingerprint_source 与当前 source 一致性校验 [NEW]
+     - not_before_utc / not_after_utc 时间窗口校验
 
 ■ 主要函数功能:
-  - build_host_fingerprint: 从 /host 挂载读取宿主机标识并生成 fingerprint_sha256
-  - load_lic_file: 读取 .lic 文件内容（JSON 包裹的密文结构）
-  - verify_lic_signature: 使用发行方公钥对 lic_core 进行 Ed25519 验签（防篡改）
-  - decrypt_lic_payload: 使用 AES-GCM 解密 payload（使 license 内容不可读）
-  - verify_payload_rules: 校验 fingerprint 绑定与有效期窗口
+  - build_expected_fingerprint: 生成 expected_fingerprint_sha256，并返回 material（含 source 等审计信息）[CHANGED]
+  - load_lic_file: 读取 .lic 文件内容
+  - verify_lic_signature: 使用发行方公钥对 lic_core 验签（防篡改）
+  - decrypt_lic_payload: 使用 AES-GCM 解密 payload
+  - verify_payload_rules: 校验 fingerprint 绑定、fingerprint_source（可选）、有效期窗口 [CHANGED]
+  - check_license_or_raise: 一次性完成全部校验并返回 payload
 
 ■ 功能特性:
-  ✓ 宿主机指纹绑定（非容器自身）
+  ✓ 多环境统一：Windows / Linux / Docker
   ✓ Ed25519 公钥验签，防篡改
-  ✓ AES-GCM 加密 payload，文件内容不可读
-  ✓ 拷贝到其他物理机通常无法解密（AES key 与 fingerprint 派生绑定）
+  ✓ AES-GCM 加密 payload，内容不可读
+  ✓ 容器内默认禁止 native 指纹（防止“绑定容器/WSL/VM”导致可迁移授权）[NEW]
   ⚠ 若攻击者可修改镜像内代码/二进制，可绕过本地校验（需编译加固/完整性自检）
 
 ■ 待办事项:
-  - [ ] 支持公钥和APPSECRET通过环境变量导入，提高维护性
-  - [ ] 将关键校验逻辑编译为 .so
+  - [ ] host_attest 文件做签名验签（Ed25519），防止伪造（推荐）
   - [ ] 增加 key_id 支持多公钥轮换
   - [ ] 增加反回拨策略（离线场景需持久化“最后成功校验时间”并做防篡改）
 
 ■ 更新日志:
   v1.0.0 (2026-01-13): 初始版本
+  v1.1.0 (2026-01-16): 接入 host_fingerprint、多环境支持、容器内禁止 native、增加 fingerprint_source 校验与环境变量注入
 
 "心之所向，素履以往；生如逆旅，一苇以航。"
 """
@@ -45,52 +55,43 @@ import hashlib
 import json
 import os
 import sys
-from dataclasses import dataclass
+import traceback
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
 
 # -------------- step: 导入加密依赖（cryptography） ---------
 try:
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-except Exception:
-    Ed25519PublicKey = None
-    AESGCM = None
+except Exception as e:
+    raise (f"Failed to import cryptography,Please install it.\n {e}")
+
+
+# -------------- step: 导入宿主机指纹模块 ---------
+import host_fingerprint
 
 
 # =============================👐Seperate👐=============================
-# 配置区（建议后续通过环境变量注入，便于部署与轮换，目前先放在这）
+# 配置区（仅保留 DEBUG_TRACEBACK / ALLOW_INSECURE_CONTAINER_NATIVE）
+# 其余配置全部移入函数入参（见 check_license_or_raise / check_license）
 # =============================👐Seperate👐=============================
 
-# -------------- step: 发行方公钥（base64，Raw 32 bytes） ---------
-ISSUER_PUBLIC_KEY_B64 = "改成你自己的密钥"
-# -------------- step: 产品根密钥（base64，建议 Raw 32 bytes） ---------
-# 注意：这不是签名私钥；它用于 AES key 派生以加密 payload，防止许可证中的内容被读取，但是加上这个也不全是好处，自己看起来也比较困难了。
-APP_SECRET_B64 = "改成你自己的密钥"
-# -------------- step: AAD（必须与发行端一致） ---------
-# 目前发行端使用 "LICv2"；如你改了发行端，这里也必须同步修改
-LICENSE_AAD = os.getenv("LICENSE_AAD", "LICv2").encode("utf-8")
+# [NEW] 输出控制：发布版默认不打印 traceback（减少内部信息暴露）
+DEBUG_TRACEBACK = os.getenv("DEBUG_TRACEBACK", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
-# -------------- step: 宿主机标识挂载路径（docker run -v ... 对应） ---------
-HOST_MACHINE_ID_PATH = os.getenv("HOST_MACHINE_ID_PATH", "/host/etc/machine-id")
-HOST_DMI_DIR = os.getenv("HOST_DMI_DIR", "/host/sys/class/dmi/id")
-
-# -------------- step: 许可证文件路径（容器内） ---------
-# 你要生成 .lic 文件并挂载到该路径
-LICENSE_PATH = os.getenv("LICENSE_PATH", "/app/license.lic")
-
-
-# =============================👐Seperate👐=============================
-# 数据结构
-# =============================👐Seperate👐=============================
-
-
-@dataclass
-class HostIds:
-    machine_id: str
-    product_uuid: str
-    board_serial: str
-    chassis_serial: str
+# [NEW] 容器内是否允许 native fingerprint
+# 交付建议保持默认 0；仅内部调试可设为 1
+ALLOW_INSECURE_CONTAINER_NATIVE = os.getenv(
+    "ALLOW_INSECURE_CONTAINER_NATIVE", "0"
+).strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 
 # =============================👐Seperate👐=============================
@@ -100,7 +101,6 @@ class HostIds:
 
 def _b64d(s: str) -> bytes:
     """base64 解码（输入字符串）"""
-    # -------------- step: 去空白并解码 ---------
     return base64.b64decode(s.strip().encode("utf-8"))
 
 
@@ -111,112 +111,144 @@ def _b64e(b: bytes) -> str:
 
 
 def _sha256_hex(s: str) -> str:
-    """SHA-256(hex)，用于宿主机指纹输出"""
-    # -------------- step: 计算哈希并转 hex ---------
+    """SHA-256(hex)，用于 fingerprint（文本 -> hex）"""
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
 def _sha256_bytes(b: bytes) -> bytes:
-    """SHA-256(bytes)，用于 AES key 派生"""
-    # -------------- step: 计算 32 bytes digest ---------
+    """SHA-256(bytes)，用于 AES key 派生（bytes -> 32 bytes digest）"""
     return hashlib.sha256(b).digest()
 
 
 def _canonical_json(obj: Dict[str, Any]) -> bytes:
     """
-    确定性 JSON 序列化（签名/验签必须一致）
-    - sort_keys=True
-    - separators=(",", ":") 去空格
+    确定性 JSON 序列化（签名/验签必须一致）：
+      - sort_keys=True     : key 排序，避免 dict 顺序影响签名
+      - separators=(",",":"): 去掉空格，保证字节级一致
     """
-    # -------------- step: 固定序列化规则，避免跨端不一致 ---------
     return json.dumps(
         obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False
     ).encode("utf-8")
 
 
 def _utc_now() -> datetime:
-    """返回当前 UTC 时间"""
-    # -------------- step: 统一使用 UTC，避免时区歧义 ---------
+    """返回当前 UTC 时间（统一用 UTC，避免时区歧义）"""
     return datetime.now(timezone.utc)
 
 
 def _parse_utc_iso8601(s: str) -> datetime:
     """
     解析 UTC ISO8601（推荐格式：2026-01-13T00:00:00Z）
+    - 兼容以 Z 结尾
+    - 统一转换到 UTC tz
     """
-    # -------------- step: 兼容 Z 结尾 ---------
     s2 = s.strip()
     if s2.endswith("Z"):
         s2 = s2[:-1] + "+00:00"
-    # -------------- step: 解析并规范到 UTC ---------
     return datetime.fromisoformat(s2).astimezone(timezone.utc)
 
 
-def _read_text_file(path: str) -> str:
-    """读取文本文件并 strip；失败返回空串"""
-    # -------------- step: 检查存在性并读取 ---------
-    try:
-        if not os.path.exists(path):
-            return ""
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            return f.read().strip()
-    except Exception:
-        return ""
-
-
-# =============================👐Seperate👐=============================
-# 宿主机指纹生成（从 /host 挂载读取）
-# =============================👐Seperate👐=============================
-
-
-def read_host_ids() -> HostIds:
+def _is_running_in_container_best_effort() -> bool:
     """
-    从宿主机挂载文件读取标识：
-      - machine-id: /host/etc/machine-id
-      - dmi: /host/sys/class/dmi/id/{product_uuid, board_serial, chassis_serial}
+    [NEW]
+    目的：guard 侧做“容器内禁止 native”约束时，需要知道自己是否在容器中运行。
+    注意：启发式判断无法 100% 准确；因此 guard 的策略是：
+      - 容器内若 source 非白名单 -> 直接拒绝（fail closed）
+      - 若误判为容器：会更严格（可能拒绝 native），但不会带来“授权放松”
     """
-    # -------------- step: 读取 machine-id ---------
-    machine_id = _read_text_file(HOST_MACHINE_ID_PATH)
+    if os.path.exists("/.dockerenv"):
+        return True
+    if os.path.exists("/run/.containerenv"):
+        return True
+    # cgroup 线索
+    for p in ("/proc/1/cgroup", "/proc/self/cgroup"):
+        try:
+            if not os.path.exists(p):
+                continue
+            with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                txt = f.read()
+            if ("docker" in txt) or ("kubepods" in txt) or ("containerd" in txt):
+                return True
+        except Exception:
+            pass
+    return False
 
-    # -------------- step: 读取 DMI（更偏物理机） ---------
-    product_uuid = _read_text_file(os.path.join(HOST_DMI_DIR, "product_uuid"))
-    board_serial = _read_text_file(os.path.join(HOST_DMI_DIR, "board_serial"))
-    chassis_serial = _read_text_file(os.path.join(HOST_DMI_DIR, "chassis_serial"))
 
-    return HostIds(
-        machine_id=machine_id,
-        product_uuid=product_uuid,
-        board_serial=board_serial,
-        chassis_serial=chassis_serial,
-    )
-
-
-def build_host_fingerprint() -> Tuple[str, HostIds, str]:
+def _require_config_or_fail(
+    issuer_public_key_b64: str,
+    effective_app_secret_b64: str,
+) -> None:
     """
-    生成宿主机指纹：
-      - raw_source: 拼接字符串（不建议外泄）
-      - fingerprint_sha256: SHA-256(raw_source) 的 hex 字符串
+    [NEW]
+    配置强校验：避免用户忘了配置密钥导致“看似能跑但实际验签/解密一定失败”。
     """
-    # -------------- step: 读取宿主机标识 ---------
-    host_ids = read_host_ids()
 
-    # -------------- step: 至少要有 machine-id 或 product_uuid ---------
-    if not host_ids.machine_id and not host_ids.product_uuid:
+    if not issuer_public_key_b64:
         raise RuntimeError(
-            "无法获取宿主机标识。请确认 docker run 已只读挂载 /etc/machine-id 和/或 /sys/class/dmi/id 到 /host。"
+            "缺少发行方公钥：请设置环境变量 ISSUER_PUBLIC_KEY_B64（Raw 32 bytes 的 base64）"
         )
 
-    # -------------- step: 组合原始材料（缺失字段用空串占位） ---------
-    raw_source = (
-        f"machine_id={host_ids.machine_id}|"
-        f"product_uuid={host_ids.product_uuid}|"
-        f"board_serial={host_ids.board_serial}|"
-        f"chassis_serial={host_ids.chassis_serial}"
-    )
+    if not effective_app_secret_b64:
+        raise RuntimeError(
+            "缺少产品根密钥：请设置 LICENSE_MASTER_KEY_B64（推荐）或 APP_SECRET_B64（兼容）"
+        )
 
-    # -------------- step: 计算 fingerprint（hex） ---------
-    fingerprint_sha256 = _sha256_hex(raw_source)
-    return fingerprint_sha256, host_ids, raw_source
+
+# =============================👐Seperate👐=============================
+# [CHANGED] 指纹生成：从旧版 build_host_fingerprint -> 新版 build_expected_fingerprint
+# =============================👐Seperate👐=============================
+
+
+def build_expected_fingerprint(
+    allowed_container_sources: Set[str] = {"host-attest", "docker-host-mount"},
+) -> Tuple[str, Dict[str, Any]]:
+    """
+    [CHANGED]
+    生成“期望指纹 expected_fingerprint_sha256”，并返回 material（审计用）。
+
+    - v1.0.0: build_host_fingerprint() 固定从 /host 读取（只能 Docker Linux host-mount）。
+    - v1.1.0: 使用 host_fingerprint.build_fingerprint() 自动选择来源（支持多环境）。[CHANGED]
+
+    返回：
+      - expected_fingerprint_sha256: hex
+      - material: dict，至少包含：
+          - platform: "windows"/"linux"（通常有）
+          - source: "host-attest"/"docker-host-mount"/"native"
+          - 其他 id 字段（机器标识）
+    """
+    if host_fingerprint is None:
+        raise RuntimeError(
+            f"无法导入 host_fingerprint.py "
+            "请确保 host_fingerprint.py 与 license_guard.py 同目录或在 PYTHONPATH 中。"
+        )
+
+    fp, material = host_fingerprint.build_fingerprint()
+
+    # -------------- step: material 基础校验（尽量早发现异常） ---------
+    if not isinstance(material, dict):
+        raise RuntimeError(
+            "host_fingerprint.build_fingerprint() 返回 material 非 dict，属于实现错误"
+        )
+
+    source = str(material.get("source", "")).strip()
+
+    # -------------- step: [NEW] 容器内强约束：禁止 source=native（除非明确允许） ---------
+    in_container = _is_running_in_container_best_effort()
+    if in_container:
+        if source not in allowed_container_sources:
+            # 若你内部要临时放开，可通过 ALLOW_INSECURE_CONTAINER_NATIVE=1
+            if ALLOW_INSECURE_CONTAINER_NATIVE and source == "native":
+                pass
+            else:
+                raise RuntimeError(
+                    "容器内禁止使用 native 指纹（防止绑定到容器/WSL/VM）。\n"
+                    f"当前 source={source!r}，允许的 source={sorted(allowed_container_sources)}。\n"
+                    "请在 docker run 中提供：\n"
+                    "  - Linux 宿主机：挂载 /etc/machine-id 与 /sys/class/dmi/id 到 /host（只读）\n"
+                    "  - Windows 宿主机：挂载 host_attest.json 到 /host/attest/host_attest.json（只读）"
+                )
+
+    return fp, material
 
 
 # =============================👐Seperate👐=============================
@@ -232,15 +264,12 @@ def load_lic_file(path: str) -> Dict[str, Any]:
       - ct_b64: AES-GCM 密文（base64，含 tag）
       - sig_b64: Ed25519 签名（base64），签名对象为 lic_core 的 canonical_json
     """
-    # -------------- step: 检查文件存在 ---------
     if not os.path.exists(path):
         raise FileNotFoundError(f"未找到许可证文件: {path}")
 
-    # -------------- step: 读取 JSON ---------
     with open(path, "r", encoding="utf-8") as f:
         lic = json.load(f)
 
-    # -------------- step: 基础字段检查 ---------
     if not isinstance(lic, dict):
         raise ValueError("许可证文件格式错误：根对象不是 JSON dict")
 
@@ -251,33 +280,27 @@ def verify_lic_signature(issuer_pubkey_b64: str, lic: Dict[str, Any]) -> Dict[st
     """
     使用 Ed25519 公钥对 lic_core 验签（防篡改）。
     返回 lic_core（用于后续解密）。
+
+    说明：
+      - 只对 lic_core（v/nonce_b64/ct_b64）做签名：
+        这样即便外层 JSON 多了字段，也不影响签名语义。
     """
-    # -------------- step: 依赖检查 ---------
     if Ed25519PublicKey is None:
         raise RuntimeError(
             "缺少依赖 cryptography，无法验签。请安装：pip install cryptography"
         )
 
-    # -------------- step: 取出必要字段 ---------
     v = lic.get("v", None)
     nonce_b64 = str(lic.get("nonce_b64", "")).strip()
     ct_b64 = str(lic.get("ct_b64", "")).strip()
     sig_b64 = str(lic.get("sig_b64", "")).strip()
 
-    # -------------- step: 格式校验（尽量明确报错） ---------
     if v is None or nonce_b64 == "" or ct_b64 == "" or sig_b64 == "":
         raise ValueError("许可证文件缺少字段：需要 v, nonce_b64, ct_b64, sig_b64")
 
-    # -------------- step: 构造验签对象（只签核心字段） ---------
-    lic_core = {
-        "v": int(v),
-        "nonce_b64": nonce_b64,
-        "ct_b64": ct_b64,
-    }
-
+    lic_core = {"v": int(v), "nonce_b64": nonce_b64, "ct_b64": ct_b64}
     msg = _canonical_json(lic_core)
 
-    # -------------- step: 公钥验签 ---------
     pub = Ed25519PublicKey.from_public_bytes(_b64d(issuer_pubkey_b64))
     try:
         pub.verify(_b64d(sig_b64), msg)
@@ -291,48 +314,49 @@ def derive_aes_key(app_secret_b64: str, fingerprint_sha256_hex: str) -> bytes:
     """
     派生 AES-256 key（32 bytes）：
       key = SHA256( app_secret_bytes || "|" || fingerprint_sha256_hex )
-    注意：这个函数必须与发行端保持一致
+
+    注意：
+      - 必须与发行端保持一致（否则解密必然失败）
+      - fingerprint_sha256_hex 统一 lower，以避免大小写差异
     """
-    # -------------- step: 解码 app_secret ---------
     app_secret = _b64d(app_secret_b64)
 
-    # -------------- step: 拼接派生材料并哈希 ---------
     material = (
         app_secret + b"|" + fingerprint_sha256_hex.strip().lower().encode("utf-8")
     )
-    return _sha256_bytes(material)  # 32 bytes
+    return _sha256_bytes(material)
 
 
 def decrypt_lic_payload(
-    app_secret_b64: str, expected_fingerprint_sha256: str, lic_core: Dict[str, Any]
+    app_secret_b64: str,
+    expected_fingerprint_sha256: str,
+    lic_core: Dict[str, Any],
+    license_aad: bytes,
 ) -> Dict[str, Any]:
     """
     AES-GCM 解密 payload：
-      - AES key 由 APP_SECRET + expected_fingerprint 派生
+      - AES key 由 APP_SECRET(或 LICENSE_MASTER_KEY) + expected_fingerprint 派生
       - nonce / ct 从 lic_core 中读取
       - AAD 必须与发行端一致（默认 LICENSE_AAD）
     """
-    # -------------- step: 依赖检查 ---------
     if AESGCM is None:
         raise RuntimeError(
-            "缺少依赖 cryptography，无法解密。请在镜像内安装：pip install cryptography"
+            "缺少依赖 cryptography，无法解密。请安装：pip install cryptography"
         )
 
-    # -------------- step: 解码 nonce 与密文 ---------
     nonce = _b64d(str(lic_core["nonce_b64"]))
     ct = _b64d(str(lic_core["ct_b64"]))
 
-    # -------------- step: 派生 AES key（与宿主机 fingerprint 绑定） ---------
     aes_key = derive_aes_key(app_secret_b64, expected_fingerprint_sha256)
 
-    # -------------- step: AES-GCM 解密（失败通常是错误机器或文件损坏） ---------
     aesgcm = AESGCM(aes_key)
     try:
-        payload_bytes = aesgcm.decrypt(nonce, ct, LICENSE_AAD)
+        payload_bytes = aesgcm.decrypt(nonce, ct, license_aad)
     except Exception:
-        raise RuntimeError("许可证解密失败：可能为非授权物理机或许可证文件损坏/不匹配")
+        raise RuntimeError(
+            "许可证解密失败：可能为非授权机器 / 许可证损坏 / AAD 或派生规则不一致"
+        )
 
-    # -------------- step: bytes -> dict ---------
     try:
         payload = json.loads(payload_bytes.decode("utf-8"))
     except Exception:
@@ -345,32 +369,50 @@ def decrypt_lic_payload(
 
 
 # =============================👐Seperate👐=============================
-# payload 业务规则校验（绑定 + 有效期）
+# [CHANGED] payload 业务规则校验（绑定 + 有效期 + fingerprint_source）
 # =============================👐Seperate👐=============================
 
 
 def verify_payload_rules(
-    payload: Dict[str, Any], expected_fingerprint_sha256: str
+    payload: Dict[str, Any],
+    expected_fingerprint_sha256: str,
+    fingerprint_material: Dict[str, Any],
 ) -> None:
     """
-    校验：
-      1) payload 内 fingerprint_sha256（如存在）与 expected 一致
-      2) not_before_utc / not_after_utc 时间窗口
+    [CHANGED]
+    校验规则：
+      1) fingerprint_sha256 绑定校验
+      2) fingerprint_source（可选）与当前 material["source"] 一致 [NEW]
+      3) not_before_utc / not_after_utc 时间窗口（UTC）
+
+    设计说明：
+      - 1) 是强绑定：确保这份 license 是给“当前机器指纹”签发的
+      - 2) 是语义绑定：确保这份 license 的“绑定来源”不被误用（例如容器里用 native）
+      - 3) 是时间授权窗口：别人即便复制 license，也无法靠改日期绕过（改了会验签失败）
     """
-    # -------------- step: 绑定校验（冗余保护，建议保留） ---------
+    # -------------- step: 1) fingerprint 绑定校验 ---------
     fp_in_payload = str(payload.get("fingerprint_sha256", "")).strip().lower()
     if fp_in_payload and fp_in_payload != expected_fingerprint_sha256.strip().lower():
         raise RuntimeError(
-            "许可证绑定校验失败：payload 内 fingerprint 不匹配当前宿主机"
+            "许可证绑定校验失败：payload 内 fingerprint_sha256 与当前机器不匹配"
         )
 
-    # -------------- step: 时间窗口字段检查 ---------
+    # -------------- step: 2) [NEW] fingerprint_source 语义绑定（可选） ---------
+    # 若发行端未写此字段，则不强制；建议你后续在签发端写入，避免误签发。
+    src_in_payload = str(payload.get("fingerprint_source", "")).strip()
+    src_now = str(fingerprint_material.get("source", "")).strip()
+    if src_in_payload:
+        if src_in_payload != src_now:
+            raise RuntimeError(
+                "许可证绑定来源校验失败：当前环境与许可证绑定规定来源不一致"
+            )
+
+    # -------------- step: 3) 时间窗口字段检查 ---------
     nb = str(payload.get("not_before_utc", "")).strip()
     na = str(payload.get("not_after_utc", "")).strip()
     if not nb or not na:
         raise RuntimeError("许可证缺少有效期字段：not_before_utc / not_after_utc")
 
-    # -------------- step: 解析时间并对比（UTC） ---------
     not_before = _parse_utc_iso8601(nb)
     not_after = _parse_utc_iso8601(na)
     now = _utc_now()
@@ -386,58 +428,93 @@ def verify_payload_rules(
 # =============================👐Seperate👐=============================
 
 
-def check_license_or_raise() -> Dict[str, Any]:
+def check_license_or_raise(
+    issuer_public_key_b64: str,
+    license_master_key_b64: str,
+    app_secret_b64: str,
+    license_aad: bytes = "LICv2".encode("utf-8"),
+    license_path: str = "/app/license.lic",
+    allowed_container_sources: Optional[Set[str]] = None,
+) -> Dict[str, Any]:
     """
     主入口：
-      - 计算宿主机指纹 expected_fingerprint_sha256
+      - 校验配置（依赖/密钥）
+      - 生成 expected_fingerprint_sha256（并获得 material/source）[CHANGED]
       - 读取 .lic
       - 验签（公钥）
       - 解密（AES-GCM）
-      - 校验绑定与有效期
+      - 校验绑定与有效期（以及 fingerprint_source 可选校验）[CHANGED]
+
     成功返回 payload（你可用来做 features/limits 等授权策略）
     """
-    # -------------- step: 生成宿主机指纹 ---------
-    expected_fingerprint_sha256, _host_ids, _raw_source = build_host_fingerprint()
+    # -------------- step: 统一命名优先 LICENSE_MASTER_KEY_B64，否则 APP_SECRET_B64 ---------
+    effective_app_secret_b64 = license_master_key_b64 or app_secret_b64
+
+    # -------------- step: [NEW] 配置/依赖强校验 ---------
+    _require_config_or_fail(
+        issuer_public_key_b64=issuer_public_key_b64,
+        effective_app_secret_b64=effective_app_secret_b64,
+    )
+
+    # -------------- step: [NEW] 容器内允许的 source（白名单） ---------
+    # - host-attest        : Windows 宿主机 Docker 推荐
+    # - docker-host-mount  : Linux 宿主机 Docker 推荐
+    if allowed_container_sources is None:
+        allowed_container_sources = {"host-attest", "docker-host-mount"}
+
+    # -------------- step: [CHANGED] 生成期望指纹（多环境统一） ---------
+    expected_fingerprint_sha256, fp_material = build_expected_fingerprint(
+        allowed_container_sources=allowed_container_sources
+    )
 
     # -------------- step: 读取 .lic ---------
-    lic = load_lic_file(LICENSE_PATH)
+    lic = load_lic_file(license_path)
 
     # -------------- step: 验签（防篡改） ---------
-    lic_core = verify_lic_signature(ISSUER_PUBLIC_KEY_B64, lic)
+    lic_core = verify_lic_signature(issuer_public_key_b64, lic)
 
-    # -------------- step: 解密 payload（防止直接读取license） ---------
-    payload = decrypt_lic_payload(APP_SECRET_B64, expected_fingerprint_sha256, lic_core)
+    # -------------- step: 解密 payload（防止直接读取 license） ---------
+    payload = decrypt_lic_payload(
+        effective_app_secret_b64,
+        expected_fingerprint_sha256,
+        lic_core,
+        license_aad,
+    )
 
-    # -------------- step: 业务规则校验（绑定+有效期） ---------
-    verify_payload_rules(payload, expected_fingerprint_sha256)
+    # -------------- step: [CHANGED] 业务规则校验（绑定+来源+有效期） ---------
+    verify_payload_rules(payload, expected_fingerprint_sha256, fp_material)
 
     return payload
 
 
 # =============================👐Seperate👐=============================
-# main（示例）：作为容器 entrypoint 的最小守护
+# main（示例）：作为 entrypoint 的最小守护
 # =============================👐Seperate👐=============================
 
 
-def check_license() -> int:
+def check_license(
+    issuer_public_key_b64: str,
+    license_master_key_b64: str,
+    app_secret_b64: str,
+    license_path: str = "/app/license.lic",
+    license_aad: bytes = "LICv2".encode("utf-8"),
+    allowed_container_sources: Optional[Set[str]] = None,
+) -> int:
     """
-    返回退出码：
-      0: 通过
-      2: 授权失败（通用）
+    检查许可证有效性
     """
-    # -------------- step: 执行校验 ---------
-    _payload = check_license_or_raise()
-
-    # -------------- step: 通过后可继续启动你的服务 ---------
-    # 这里仅示例打印；生产环境建议直接进入你的业务入口（import + run）
+    _payload = check_license_or_raise(
+        issuer_public_key_b64=issuer_public_key_b64,
+        license_master_key_b64=license_master_key_b64,
+        app_secret_b64=app_secret_b64,
+        license_aad=license_aad,
+        license_path=license_path,
+        allowed_container_sources=allowed_container_sources,
+    )
+    # 通过后可继续启动你的服务；这里只示例打印
     print("License OK. Host authorized.")
     return 0
 
 
 if __name__ == "__main__":
-    try:
-        sys.exit(check_license())
-    except Exception as e:
-        # 注意：不要打印 raw_source，避免泄露宿主机敏感标识拼接材料
-        print(f"License check failed: {e}", file=sys.stderr)
-        sys.exit(2)
+    pass
